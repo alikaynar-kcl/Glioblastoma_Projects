@@ -1,0 +1,556 @@
+---
+title: "GBM_Second_Project"
+author: "Ali Kaynar"
+date: "2024-01-27"
+output: 
+# rm(list=ls())
+---
+###(((((((.- .-.. .. / -.- .- -.-- -. .- .-.)))))))###
+# Introduction
+Briefly describe the purpose of the analysis and the dataset used.
+Perform DEG analysis, Gene-Enrichment Analysis, and other statistical analysis.
+# Setup
+```{r setup, message=FALSE, warning=FALSE}
+setwd("~/{PATH}") # Set your working directory
+library(TCGAbiolinks)
+library(DESeq2)
+library(biomaRt)
+library(clusterProfiler)
+library(openxlsx)
+library(xlsx)
+library(writexl)
+library(ggplot2)
+library(dplyr)
+#library(R.matlab)
+```
+# Data Loading
+```{r data-loading}
+# Load your datasets here
+load("~/{PATH}/TCGA_GBM.Rdata") # TCGAbiolinks data structure
+load("~/{PATH}/HPA_Info.RData") # HPA gene information
+# Removed_samples (Duplicate) are "TCGA-06-0156-01A-03R-1849-01" and "TCGA-06-0211-01B-01R-1849-01"
+```
+Remove annotation version indicator for uniformity and compatibility with External Databases
+Ensemble gene ID: "ENSG00000067177.15" --->> "ENSG00000067177". 
+```{r echo=FALSE}
+# 
+TCGA_GBM@rowRanges@ranges@NAMES <- sapply(strsplit(TCGA_GBM@rowRanges@ranges@NAMES,"\\."), function(x) x[1])
+TCGA_GBM@rowRanges@elementMetadata@listData[["gene_id"]] <- sapply(strsplit(TCGA_GBM@rowRanges@elementMetadata@listData[["gene_id"]],"\\."), function(x) x[1])
+```
+**Analysis includes Primary solid Tumor sample which includes only sample that have Tumor Purity Score(TPS) and Solid Tissue Normal. 
+**Control vs Disease comparison and High TPS vs Low TPS comparison
+Categorize the data: Solid Tissue Normal (NT), Recurrent Solid Tumor (TR) whic is not included in the study, Primary solid Tumor (TP), High Tumor Purity Score (high_tps) and Low Tumor Purity Score (low_tps)
+
+Separation of data depending on definition. Later these separated structure could be combine. 
+```{r}
+TCGA_NT<-TCGA_GBM[,TCGA_GBM@colData@listData[["definition"]]=="Solid Tissue Normal"]
+
+TCGA_TR<-TCGA_GBM[,TCGA_GBM@colData@listData[["definition"]]=="Recurrent Solid Tumor"]
+
+TCGA_TP<-TCGA_GBM[,TCGA_GBM@colData@listData[["definition"]]=="Primary solid Tumor"]
+TCGA_TP<-TCGA_TP[,-which(is.na(TCGA_TP@colData@listData[["paper_ABSOLUTE.purity"]]))]
+
+# Extraction of High TPS and Low TPS samples.  First and fourth quantile used for separation. Samples sorted ascending purity score 
+tps_col <- TCGA_TP@colData@listData[["paper_ABSOLUTE.purity"]]; tps_col
+tps_quantile_25 <- quantile(tps_col, 0.25); tps_quantile_25
+tps_quantile_75 <- quantile(tps_col, 0.75); tps_quantile_75
+
+low_tps <- TCGA_TP[,tps_col <= tps_quantile_25]
+mid_tps <- TCGA_TP[,tps_col > tps_quantile_25 & tps_col < tps_quantile_75]
+high_tps <- TCGA_TP[,tps_col  >= tps_quantile_75]
+```
+
+# Analysis
+Include analysis code chunks below
+
+Comparison of NT and TR, which is not included in the study
+```{r}
+# Extraction of un-stranded gene count value from data structure  
+NT_TR<-cbind(TCGA_NT,TCGA_TR) # Combine two data structure
+
+NT_TR_clinic <- data.frame(barcode = NT_TR$barcode, definition = NT_TR$definition)
+NT_TR_clinic$condition<-as.factor(NT_TR$definition) # Setting condition as factor
+
+# Checking outlier!
+# NOTE: TCGAanalyze_Preprocessing changes sample order! Be carefull.
+NT_TR_count <- TCGAanalyze_Preprocessing(object = NT_TR,cor.cut = 0.80,datatype = "unstranded")
+
+NT_TR_C <- NT_TR[which(rowMeans(NT_TR@assays@data@listData$unstranded)>=10),] ## keep expressed gene.
+NT_TR_count<-data.matrix(NT_TR_C@assays@data@listData$unstranded)
+colnames(NT_TR_count)<-colnames(NT_TR_C)
+rownames(NT_TR_count)<-rownames(NT_TR_C)
+
+# # Reaaragnge  sample order accordingly NT_TR datastuture
+# NT_TR_count<-NT_TR_count[,NT_TR_clinic$barcode]
+# 
+# #Make sure matrix and clinic should be same order
+# Cont_Samp_Ord<-rbind(colnames(NT_TR_count),NT_TR_clinic$barcode, NT_TR_C$barcode)
+```
+
+# DSEq2 Process
+```{r warning=TRUE}
+dds_NT_TR <- DESeqDataSetFromMatrix(countData=NT_TR_count,
+                                       colData=NT_TR_clinic,
+                                       design=~condition)
+# Solid Tissue Normal set as reference
+dds_NT_TR$condition <- relevel(dds_NT_TR$condition, ref = "Solid Tissue Normal") 
+
+dds_NT_TR = DESeq(dds_NT_TR)
+result_dds_NT_TR = results(dds_NT_TR)
+summary(result_dds_NT_TR)
+View(as.data.frame(result_dds_NT_TR))
+
+nrow(result_dds_NT_TR)
+sum( is.na(result_dds_NT_TR$pvalue) )
+res_dds_NT_TR = result_dds_NT_TR[ ! is.na(result_dds_NT_TR$pvalue), ]
+res_dds_NT_TR = res_dds_NT_TR[ order(res_dds_NT_TR$pvalue), ]
+
+DESeq_Table_dds_NT_TR<-as.data.frame(res_dds_NT_TR)
+```
+Combining Gene information, including means expression and IDs,  with HPA gene informaton 
+```{r}
+TCGA_sum<-data.frame(Ensemble_ID=rownames(TCGA_GBM),
+gene_name=TCGA_GBM@rowRanges@elementMetadata@listData[["gene_name"]],
+hgnc_id=TCGA_GBM@rowRanges@elementMetadata@listData[["hgnc_id"]],
+mean_NT=rowMeans(TCGA_NT@assays@data@listData$tpm_unstrand),
+mean_TR=rowMeans(TCGA_TR@assays@data@listData$tpm_unstrand),
+mean_TP=rowMeans(TCGA_TP@assays@data@listData$tpm_unstrand),
+mean_low_tps=rowMeans(low_tps@assays@data@listData$tpm_unstrand),
+mean_high_tps=rowMeans(high_tps@assays@data@listData$tpm_unstrand),
+mean_mid_tps=rowMeans(mid_tps@assays@data@listData$tpm_unstrand))
+rownames(TCGA_sum)<-TCGA_sum$Ensemble_ID
+
+DESeq_Table_dds_NT_TR_2 <- merge(DESeq_Table_dds_NT_TR,TCGA_sum, by = 0, all.x = TRUE)
+rownames(DESeq_Table_dds_NT_TR_2)<-DESeq_Table_dds_NT_TR_2$Row.names
+DESeq_Table_dds_NT_TR_2 <- merge(DESeq_Table_dds_NT_TR_2,HPA_Info, by = 0, all.x = TRUE)
+
+```
+Gene Expression input for GEM generation. Mean of each genes calculated for all groups.
+```{r}
+Model_input_T<-TCGA_sum[,c("Ensemble_ID","mean_NT","mean_TR", "mean_TP","mean_low_tps","mean_mid_tps","mean_high_tps")]
+
+# Create a "Results" folder in the current working directory
+results_folder <- file.path("{PATH}", "Results")
+if (!dir.exists(results_folder)) {
+  dir.create(results_folder)
+}
+# Define the save path within the "Results" folder
+save_path <- file.path(results_folder, "Model_input_T.txt")
+# Save the table as a text file in the "Results" folder
+write.table(Model_input_T, file = save_path, row.names = FALSE)
+```
+# Analysis
+Include analysis code chunks below
+Comparison of NT and TP
+
+```{r}
+# Extract un-stranded count value from data structure  
+NT_TP<-cbind(TCGA_NT,TCGA_TP) # Combine two data structure
+
+NT_TP_clinic <- data.frame(barcode = NT_TP$barcode, definition = NT_TP$definition)
+NT_TP_clinic$condition<-as.factor(NT_TP$definition)
+
+# Checking outlier!
+# NOTE: TCGAanalyze_Preprocessing changes sample order!
+NT_TP_count <- TCGAanalyze_Preprocessing(object = NT_TP,cor.cut = 0.80,datatype = "unstranded")
+
+NT_TP_C <- NT_TP[which(rowMeans(NT_TP@assays@data@listData$unstranded)>=10),] ## keep expressed gene
+NT_TP_count<-data.matrix(NT_TP_C@assays@data@listData$unstranded)
+colnames(NT_TP_count)<-colnames(NT_TP_C)
+rownames(NT_TP_count)<-rownames(NT_TP_C)
+
+```
+
+# DSEq2 Process
+```{r warning=TRUE}
+dds_NT_TP <- DESeqDataSetFromMatrix(countData=NT_TP_count,
+                                    colData=NT_TP_clinic,
+                                    design=~condition)
+# Solid Tissue Normal set as reference
+ dds_NT_TP$condition <- relevel(dds_NT_TP$condition, ref = "Solid Tissue Normal") 
+# dds_NT_TP$condition <- relevel(dds_NT_TP$condition, ref = "Primary solid Tumor") # This code used to generate DEG results to generate NT GEM model compare to TP GEM model.
+
+dds_NT_TP = DESeq(dds_NT_TP)
+result_dds_NT_TP = results(dds_NT_TP)
+summary(result_dds_NT_TP)
+View(as.data.frame(result_dds_NT_TP))
+
+nrow(result_dds_NT_TP)
+sum( is.na(result_dds_NT_TP$pvalue) )
+res_dds_NT_TP = result_dds_NT_TP[ ! is.na(result_dds_NT_TP$pvalue), ]
+res_dds_NT_TP = res_dds_NT_TP[ order(res_dds_NT_TP$pvalue), ]
+
+#DESeq_Table_dds_NT_TP<-as.data.frame(res_dds_NT_TP)
+
+DESeq_Table_dds_TP_NT<-as.data.frame(res_dds_NT_TP)
+```
+Combining Gene information, including means expression and IDs,  with HPA gene informaton 
+```{r}
+DESeq_Table_dds_TP_NT_2 <- merge(DESeq_Table_dds_TP_NT,TCGA_sum, by = 0, all.x = TRUE)
+rownames(DESeq_Table_dds_TP_NT_2)<-DESeq_Table_dds_TP_NT_2$Row.names
+DESeq_Table_dds_TP_NT_2 <- merge(DESeq_Table_dds_TP_NT_2,HPA_Info, by = 0, all.x = TRUE)
+
+
+```
+# Analysis
+Include analysis code chunks below
+
+Comparison of high_tps and low_tps
+```{r}
+# Extract un-stranded count value from data structure  
+high_low<-cbind(high_tps,low_tps) # Combine two data structure
+array_high_low <- c(rep("high", dim(high_tps)[2]), rep("low", dim(low_tps)[2]))
+high_low_clinic <- data.frame(barcode = high_low$barcode, definition = high_low$definition)
+high_low_clinic$condition<-as.factor(array_high_low)
+
+# Checking outlier!
+# NOTE: TCGAanalyze_Preprocessing changes sample order!
+high_low_count <- TCGAanalyze_Preprocessing(object = high_low,cor.cut = 0.80,datatype = "unstranded")
+
+high_low_C <- high_low[which(rowMeans(high_low@assays@data@listData$unstranded)>=10),] ## keep expressed gene
+high_low_count<-data.matrix(high_low_C@assays@data@listData$unstranded)
+colnames(high_low_count)<-colnames(high_low_C)
+rownames(high_low_count)<-rownames(high_low_C)
+
+```
+
+# DSEq2 Process
+```{r warning=TRUE}
+dds_high_low <- DESeqDataSetFromMatrix(countData=high_low_count,
+                                       colData=high_low_clinic,
+                                       design=~condition)
+# Solid Tissue Normal set as reference
+dds_high_low$condition <- relevel(dds_high_low$condition, ref = "low") 
+
+dds_high_low = DESeq(dds_high_low)
+result_dds_high_low = results(dds_high_low)
+summary(result_dds_high_low)
+View(as.data.frame(result_dds_high_low))
+
+nrow(result_dds_high_low)
+sum( is.na(result_dds_high_low$pvalue) )
+res_dds_high_low = result_dds_high_low[ ! is.na(result_dds_high_low$pvalue), ]
+res_dds_high_low = res_dds_high_low[ order(res_dds_high_low$pvalue), ]
+
+DESeq_Table_dds_high_low<-as.data.frame(res_dds_high_low)
+```
+Combining Gene information, including means expression and IDs,  with HPA gene informaton 
+```{r}
+DESeq_Table_dds_high_low_2 <- merge(DESeq_Table_dds_high_low,TCGA_sum, by = 0, all.x = TRUE)
+rownames(DESeq_Table_dds_high_low_2)<-DESeq_Table_dds_high_low_2$Row.names
+DESeq_Table_dds_high_low_2 <- merge(DESeq_Table_dds_high_low_2,HPA_Info, by = 0, all.x = TRUE)
+
+```
+# Analysis
+Include analysis code chunks below
+Comparison of NT and low_tps
+```{r}
+# Extract un-stranded count value from data structure  
+NT_low<-cbind(TCGA_NT,low_tps) # Combine two data structure
+NT_low_clinic <- data.frame(barcode = NT_low$barcode, definition = NT_low$definition)
+NT_low_clinic$condition<-as.factor(NT_low$definition)
+
+# Checking outlier!
+# NOTE: TCGAanalyze_Preprocessing changes sample order!
+NT_low_count <- TCGAanalyze_Preprocessing(object = NT_low,cor.cut = 0.80,datatype = "unstranded")
+
+NT_low_C <- NT_low[which(rowMeans(NT_low@assays@data@listData$unstranded)>=10),] ## keep expressed gene
+NT_low_count<-data.matrix(NT_low_C@assays@data@listData$unstranded)
+colnames(NT_low_count)<-colnames(NT_low_C)
+rownames(NT_low_count)<-rownames(NT_low_C)
+
+```
+
+# DSEq2 Process
+```{r warning=TRUE}
+dds_NT_low <- DESeqDataSetFromMatrix(countData=NT_low_count,
+                                       colData=NT_low_clinic,
+                                       design=~condition)
+# Solid Tissue Normal set as reference
+dds_NT_low$condition <- relevel(dds_NT_low$condition, ref = "Solid Tissue Normal") 
+
+dds_NT_low = DESeq(dds_NT_low)
+result_dds_NT_low = results(dds_NT_low)
+summary(result_dds_NT_low)
+View(as.data.frame(result_dds_NT_low))
+
+nrow(result_dds_NT_low)
+sum( is.na(result_dds_NT_low$pvalue) )
+res_dds_NT_low = result_dds_NT_low[ ! is.na(result_dds_NT_low$pvalue), ]
+res_dds_NT_low = res_dds_NT_low[ order(res_dds_NT_low$pvalue), ]
+
+DESeq_Table_dds_NT_low<-as.data.frame(res_dds_NT_low)
+```
+Combining Gene information, including means expression and IDs,  with HPA gene informaton 
+```{r}
+DESeq_Table_dds_NT_low_2 <- merge(DESeq_Table_dds_NT_low,TCGA_sum, by = 0, all.x = TRUE)
+rownames(DESeq_Table_dds_NT_low_2)<-DESeq_Table_dds_NT_low_2$Row.names
+DESeq_Table_dds_NT_low_2 <- merge(DESeq_Table_dds_NT_low_2,HPA_Info, by = 0, all.x = TRUE)
+
+```
+# Analysis
+Include analysis code chunks below
+Comparison of NT and high_tps
+```{r}
+# Extract un-stranded count value from data structure  
+NT_high<-cbind(TCGA_NT,high_tps) # Combine two data structure
+NT_high_clinic <- data.frame(barcode = NT_high$barcode, definition = NT_high$definition)
+NT_high_clinic$condition<-as.factor(NT_high$definition)
+
+# Checking outlier!
+# NOTE: TCGAanalyze_Preprocessing changes sample order!
+NT_high_count <- TCGAanalyze_Preprocessing(object = NT_high,cor.cut = 0.80,datatype = "unstranded")
+
+NT_high_C <- NT_high[which(rowMeans(NT_high@assays@data@listData$unstranded)>=10),] ## keep expressed gene
+NT_high_count<-data.matrix(NT_high_C@assays@data@listData$unstranded)
+colnames(NT_high_count)<-colnames(NT_high_C)
+rownames(NT_high_count)<-rownames(NT_high_C)
+
+```
+
+# DSEq2 Process
+```{r warning=TRUE}
+dds_NT_high <- DESeqDataSetFromMatrix(countData=NT_high_count,
+                                     colData=NT_high_clinic,
+                                     design=~condition)
+# Solid Tissue Normal set as reference
+dds_NT_high$condition <- relevel(dds_NT_high$condition, ref = "Solid Tissue Normal") 
+
+dds_NT_high = DESeq(dds_NT_high)
+result_dds_NT_high = results(dds_NT_high)
+summary(result_dds_NT_high)
+View(as.data.frame(result_dds_NT_high))
+
+nrow(result_dds_NT_high)
+sum( is.na(result_dds_NT_high$pvalue) )
+res_dds_NT_high = result_dds_NT_high[ ! is.na(result_dds_NT_high$pvalue), ]
+res_dds_NT_high = res_dds_NT_high[ order(res_dds_NT_high$pvalue), ]
+
+DESeq_Table_dds_NT_high<-as.data.frame(res_dds_NT_high)
+```
+Combining Gene information, including means expression and IDs,  with HPA gene informaton 
+```{r}
+DESeq_Table_dds_NT_high_2 <- merge(DESeq_Table_dds_NT_high,TCGA_sum, by = 0, all.x = TRUE)
+rownames(DESeq_Table_dds_NT_high_2)<-DESeq_Table_dds_NT_high_2$Row.names
+DESeq_Table_dds_NT_high_2 <- merge(DESeq_Table_dds_NT_high_2,HPA_Info, by = 0, all.x = TRUE)
+
+```
+
+Analysis of Purity and Gene Expression data
+
+```{r}
+Pur_1<- as.numeric(TCGA_TP@colData@listData[["paper_ABSOLUTE.purity"]])
+```
+
+```{r}
+# Shapiro-Wilk test for normality
+shapiro.test(Pur_1)
+#p-value indicates significance, we reject the null hypothesis that the data is normally distributed.
+
+```
+
+# ENRICHMENT ANALYSIS
+Required packages
+```{r}
+library(clusterProfiler)
+library(dplyr)
+library(tidyr)
+library(DOSE)
+library(GO.db)
+library(org.Hs.eg.db)
+library(GSEABase)
+library(viridis)  # cividis color palette
+source('/{PATH}/deg_GoTerm_clusterProfiler.R') # it makes the result as a table 
+```
+
+Volcano plot
+
+```{r pressure, echo=FALSE}
+# Create volcano plot using the DEG result (RES_DEG). This chunk is automated to create figures and saving it-naming it.
+Comparison<- 'High TPS vs Low TPS'; # 
+# Save the res
+RES_DEG<-DESeq_Table_dds_high_low_2
+
+rownames(RES_DEG)<-RES_DEG$Ensemble_ID
+deg_results_df1<- subset(RES_DEG, padj < 1e-10 & abs(log2FoldChange) > 1) # We focused on P-value rather than fold change.
+deg_results_df<- RES_DEG[,c("Ensemble_ID","gene_name", "baseMean","log2FoldChange", "lfcSE","stat","pvalue","padj")]
+
+# Define the file path for saving the Excel file
+file_path <- paste0(results_folder, "/", Comparison,".xlsx")
+# Write the top_genes dataframe to an Excel file
+write_xlsx(deg_results_df1, file_path)
+
+deg_results_df <- deg_results_df %>% arrange(padj)
+
+volcano_plot <- ggplot(data = deg_results_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(size = 1, color = ifelse(deg_results_df$padj < 1e-10 & abs(deg_results_df$log2FoldChange) > 1, "red", "black")) +
+  geom_hline(yintercept = -log10(1e-10), linetype = "dashed", color = "blue") + #horizontal line
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "blue") + # vertical line
+  labs(x = "log2FoldChange", y = "-log10(padj-value)", title = paste0("Volcano Plot Highlighting Significant Changes in ", Comparison)) + #  modifying the labels and title 
+  theme_minimal() + # make it simple: removes grid lines, panel borders, colors
+  theme(text = element_text(size = 12),  # base font size
+        axis.title = element_text(size = rel(2)),  # axis title font size
+        axis.text = element_text(size = rel(1.5)),  # axis text font size
+        plot.title = element_text(size = rel(2.5)))  # plot title font size
+
+# Add text annotations for the top 50 variable names
+top_genes <- subset(deg_results_df, padj < 1e-10 & abs(log2FoldChange) > 1)[1:50, ]
+volcano_plot <- volcano_plot +
+  geom_text(data = top_genes, aes(label = gene_name), vjust = -0.5, size = 6)  # text size adjustment
+
+volcano_plot
+
+# Save the volcano plot as tiff image file with white background
+ggsave(filename = paste0(results_folder, "/", "Volcano Plot Highlighting Significant Changes in", Comparison,".tiff"),
+       plot = volcano_plot,
+       width = 16,
+       height = 12,
+       dpi = 400,
+       bg = "white")
+```
+
+Go Term enrichment
+```{r}
+# Interested gene list (DEG significant genes)
+## mart = useMart("ensembl",dataset = "hsapiens_gene_ensembl")
+# mart <- useMart("ensembl", host = "https://www.ensembl.org", dataset = "hsapiens_gene_ensembl")
+# Comparison<- 'NT vs TP';
+ont1 <- "CC"# "BP" "MF"   
+# CC cellular component
+# MF: Molecular Function 
+# BP: Biological Process
+header_F <- paste0("Highlighting Significant GO Terms ",ont1, "; ", Comparison, sep="")
+# Perform GO enrichment
+background <- as.matrix(deg_results_df$gene_name)
+int_gene <- as.matrix(deg_results_df1$gene_name) # Check if conversion to matrix is necessary; typically, a vector is used
+pathway <- enrichGO(gene = int_gene, OrgDb = 'org.Hs.eg.db', keyType = "SYMBOL", ont = ont1, universe = background, pAdjustMethod = "BH", qvalueCutoff = 0.05) # Output
+
+# GeneExp<-NULL
+# for (i in 1:length(pathway@result[["BgRatio"]])){
+#   gene_ratio <- pathway@result[["GeneRatio"]][i]
+#   s_gene_ratio <- as.numeric(strsplit(gene_ratio, "/")[[1]])
+#   Bg_ratio <- pathway@result[["BgRatio"]][i]
+#   s_Bg_ratio <- as.numeric(strsplit(Bg_ratio, "/")[[1]])
+#   GeneExp[i]<-(s_Bg_ratio[1]*s_gene_ratio[2])/s_Bg_ratio[2]
+# }
+# pathway@result[["GeneExp"]]<-GeneExp
+
+# save the table
+path_table_all<-deg_GoTerm_clusterProfiler(pathway)
+write.table(pathway, file = paste0(results_folder, "/",header_F,".txt"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+```{r pressure, echo=FALSE}
+# path_table_all contains 'term_name', 'Count', and 'p.adjust. it's sorted and filtered to top 20 by p.adjust
+top20 <- head(path_table_all[order(path_table_all$p.adjust), ], 20)
+
+# The bar plot generate with ggplot, ordering bars based on p.adjust value
+ggplot(top20, aes(x = reorder(term_name, -p.adjust), y = Count, fill = -p.adjust)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flip coordinates to make bar plot horizontal 
+  #scale_fill_gradient(low = "yellow", high = "darkblue", name = "Adjusted P-Value") +  # Color-blind friendly gradient
+  scale_fill_viridis_c(option = "cividis",direction = -1, name = "Adjusted P-Value") +  # cividis color map was constructed according to p.adjust
+  labs(title = header_F, x = "Term Name", y = "Count") + # labels
+  theme_minimal(base_family = "sans") + # all font family will be sans-serif font 
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA),  # plot background is white
+    panel.background = element_rect(fill = "white", colour = NA),  # panel background is white
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"), # face = title
+    legend.position = "right" # legend position
+  ) +
+  theme(plot.margin = margin(1, 1, 1.5, 1.5, "cm")) # margins on the top, right, bottom, and left. That ensure you can fit the term name in the figure.
+
+# Save the plot
+ggsave(paste0(results_folder, "/",header_F, ".tiff"), width = 12, height = 12, units = 'in', dpi = 300)
+```
+
+KEGG Pathway Analysis
+```{r}
+int_gene<-as.matrix(deg_results_df1$gene_name) # interested genes: significantly altered genes
+
+# in KEGG pathway analysis entrez gene ID recommended and widely used. So convert gene symbol or ensemble gene id to entrez gene id
+int_gene_kegg = getBM(attributes = c("hgnc_symbol","entrezgene_id"),values =int_gene ,filters = "hgnc_symbol",mart = mart)
+int_gene_kegg<-int_gene_kegg %>% drop_na()
+
+# In general your gene list after low expressed gene filter is background genes = universe.
+background2 = getBM(attributes = c("hgnc_symbol","entrezgene_id"),values =deg_results_df$gene_name,filters = "hgnc_symbol",mart = mart)
+background2<-background2 %>% drop_na()
+
+#KEGG pathway analysis
+ekegg = enrichKEGG(gene = as.character(int_gene_kegg$entrezgene_id),
+                   organism = "hsa",
+                   keyType = "kegg",
+                   pvalueCutoff = 0.05,
+                   pAdjustMethod = "BH",
+                   universe=as.character(background2$entrezgene_id),
+                   qvalueCutoff = 0.05,
+                   use_internal_data = TRUE)
+
+write.table(ekegg, file = paste0(results_folder, "/","Highlighting Significant KEGG Pathways; ", Comparison,".txt"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+# some time significant term number lower that first 10 or 20 term yo wish to visualize. So it is better to check number of significant KEGG term. 
+if (class(ekegg) == "enrichResult") {
+  ekegg_df <- as.data.frame(ekegg)[order(as.data.frame(ekegg)$p.adjust), ]
+  ekegg_df <- head(ekegg_df, 20)
+} else {
+  ekegg_df <- ekegg
+}
+
+# The bar plot generate with ggplot, ordering bars based on p.adjust value
+ggplot(ekegg_df, aes(x = reorder(Description, -p.adjust), y = Count, fill = -p.adjust)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # make it horizontal
+  scale_fill_viridis_c(option = "cividis", direction = -1, name = "Adjusted P-Value") + 
+  labs(title = paste("Highlighting Significant KEGG Pathways; ", Comparison), x = "Pathway", y = "Count") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA),  
+    panel.background = element_rect(fill = "white", colour = NA),  
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "right"
+  ) +
+  theme(plot.margin = margin(1, 1, 1.5, 1.5, "cm"))
+
+# Save the plot
+ggsave(paste0(results_folder, "/","Highlighting Significant KEGG Pathways; ", Comparison, ".tiff"), width = 12, height = 12, units = 'in', dpi = 300)
+
+```
+
+
+Saving DEG Results for GEM analysis to perform reporter metabolites analysis.
+```{r}
+library(writexl)
+all_objects <- ls()
+
+# filter object names based on that start with "DESeq" and doesn't end with "_2"
+selected_names <- grep("^DESeq(?!.*_2$).*", all_objects, perl = TRUE, value = TRUE)
+dataList <- sapply(selected_names, get, simplify = FALSE)
+names(dataList) <- selected_names  # Set the names of dataList elements
+
+excelFilePath <- "{PATH}/DEG_RES_2.xlsx"
+write_xlsx(dataList, path = excelFilePath)
+
+
+# filter object names based on that start with "DESeq_Table_dds_" and end with "_2"
+selected_names_2 <- grep("^DESeq_Table_dds_.*_2$", all_objects, value = TRUE)
+
+dataList_2 <- sapply(selected_names_2, get, simplify = FALSE) # Create a list of these data frames
+
+filteredDataList_2 <- lapply(dataList_2, function(df) {
+  df_filtered <- df[df$padj < 0.01, ]  # filter for rows where p.adjust < 0.01
+  return(df_filtered)
+})
+
+excelFilePath <- "{PATH}/DEG_RES_4.xlsx"
+names(filteredDataList_2) <- selected_names_2
+# Now write the named list to the Excel file
+write_xlsx(filteredDataList_2, path = excelFilePath)
+
+```
